@@ -9,6 +9,7 @@
 #include "video_output.h"
 
 #include <algorithm>
+#include <utility>
 
 // Limit the frame size to 1080p in software rendering.
 // This is for performance reasons & to avoid allocating too much memory.
@@ -16,6 +17,34 @@
 #define SW_RENDERING_MAX_HEIGHT 1080
 #define SW_RENDERING_PIXEL_BUFFER_SIZE \
   (SW_RENDERING_MAX_WIDTH) * (SW_RENDERING_MAX_HEIGHT) * (4)
+
+// DsPlayer fix (2026-11-18): upstream clamped |GetVideoWidth|/|GetVideoHeight|
+// with per-axis integer math (`width / height * MAX`), which evaluates to 0
+// for portrait videos (e.g. 1080x1918: 1080 / 1918 = 0 in integer division).
+// |CheckAndResize| then bails on its <1 guard, the texture stays at its
+// initial 1x1 and every frame renders into a single pixel => permanent black
+// screen with working audio (every video taller than 1080p was affected).
+// Compute the aspect-preserving fit ONCE so both accessors agree.
+static std::pair<int64_t, int64_t> FitSwRenderSize(int64_t width,
+                                                   int64_t height) {
+  if (width < 1 || height < 1) {
+    return {width, height};
+  }
+  // No std::min here: Windows.h (via thread_pool.h) defines min/max macros.
+  double scale = 1.0;
+  const double scale_w =
+      static_cast<double>(SW_RENDERING_MAX_WIDTH) / width;
+  const double scale_h =
+      static_cast<double>(SW_RENDERING_MAX_HEIGHT) / height;
+  if (scale_w < scale) {
+    scale = scale_w;
+  }
+  if (scale_h < scale) {
+    scale = scale_h;
+  }
+  return {static_cast<int64_t>(width * scale),
+          static_cast<int64_t>(height * scale)};
+}
 
 VideoOutput::VideoOutput(int64_t handle,
                          VideoOutputConfiguration configuration,
@@ -151,14 +180,28 @@ void VideoOutput::NotifyRender() {
   if (destroyed_) {
     return;
   }
-  thread_pool_ref_->Post(std::bind(&VideoOutput::CheckAndResize, this));
-  thread_pool_ref_->Post(std::bind(&VideoOutput::Render, this));
+  // DsPlayer fix: run CheckAndResize & Render as ONE task. Upstream posted
+  // them separately, so with >1 worker they could run concurrently — Render
+  // could observe |texture_id_ == 0| mid-resize (std::out_of_range swallowed
+  // by the packaged_task) and silently drop frames.
+  thread_pool_ref_->Post([this]() {
+    if (destroyed_) {
+      return;
+    }
+    CheckAndResize();
+    Render();
+  });
 }
 
 void VideoOutput::Render() {
   if (texture_id_) {
     // H/W
     if (surface_manager_ != nullptr) {
+      std::lock_guard<std::mutex> lock(textures_mutex_);
+      if (textures_.find(texture_id_) == textures_.end()) {
+        // Resize in-flight; the next |NotifyRender| will retry.
+        return;
+      }
       surface_manager_->Draw([&]() {
         mpv_opengl_fbo fbo{
             0,
@@ -170,14 +213,24 @@ void VideoOutput::Render() {
             {MPV_RENDER_PARAM_OPENGL_FBO, &fbo},
             {MPV_RENDER_PARAM_INVALID, nullptr},
         };
-        mpv_render_context_render(render_context_, params);
+        auto error = mpv_render_context_render(render_context_, params);
+        if (error < 0) {
+          std::cout << "media_kit: VideoOutput: H/W render failed: "
+                    << mpv_error_string(error) << std::endl;
+        }
       });
     }
     // S/W
     if (pixel_buffer_ != nullptr) {
+      std::lock_guard<std::mutex> lock(textures_mutex_);
+      auto texture = pixel_buffer_textures_.find(texture_id_);
+      if (texture == pixel_buffer_textures_.end()) {
+        // Resize in-flight; the next |NotifyRender| will retry.
+        return;
+      }
       int32_t size[]{
-          static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->width),
-          static_cast<int32_t>(pixel_buffer_textures_.at(texture_id_)->height),
+          static_cast<int32_t>(texture->second->width),
+          static_cast<int32_t>(texture->second->height),
       };
       auto pitch = 4 * size[0];
       mpv_render_param params[]{
@@ -187,7 +240,11 @@ void VideoOutput::Render() {
           {MPV_RENDER_PARAM_SW_POINTER, pixel_buffer_.get()},
           {MPV_RENDER_PARAM_INVALID, nullptr},
       };
-      mpv_render_context_render(render_context_, params);
+      auto error = mpv_render_context_render(render_context_, params);
+      if (error < 0) {
+        std::cout << "media_kit: VideoOutput: S/W render failed: "
+                  << mpv_error_string(error) << std::endl;
+      }
     }
     try {
       // Notify Flutter that a new frame is available.
@@ -251,8 +308,14 @@ void VideoOutput::CheckAndResize() {
     current_height = surface_manager_->height();
   }
   if (pixel_buffer_ != nullptr) {
-    current_width = pixel_buffer_textures_.at(texture_id_)->width;
-    current_height = pixel_buffer_textures_.at(texture_id_)->height;
+    std::lock_guard<std::mutex> lock(textures_mutex_);
+    auto texture = pixel_buffer_textures_.find(texture_id_);
+    if (texture == pixel_buffer_textures_.end()) {
+      // Resize in-flight; the next |NotifyRender| will retry.
+      return;
+    }
+    current_width = texture->second->width;
+    current_height = texture->second->height;
   }
   // Currently rendered video output dimensions.
   // Either H/W or S/W rendered.
@@ -401,12 +464,7 @@ int64_t VideoOutput::GetVideoWidth() {
   if (pixel_buffer_ != nullptr) {
     // Make sure |width| & |height| fit between |SW_RENDERING_MAX_WIDTH| &
     // |SW_RENDERING_MAX_HEIGHT| while maintaining aspect-ratio.
-    if (width >= SW_RENDERING_MAX_WIDTH) {
-      return SW_RENDERING_MAX_WIDTH;
-    }
-    if (height >= SW_RENDERING_MAX_HEIGHT) {
-      return width / height * SW_RENDERING_MAX_HEIGHT;
-    }
+    return FitSwRenderSize(width, height).first;
   }
 
   return width;
@@ -450,12 +508,7 @@ int64_t VideoOutput::GetVideoHeight() {
   if (pixel_buffer_ != NULL) {
     // Make sure |width| & |height| fit between |SW_RENDERING_MAX_WIDTH| &
     // |SW_RENDERING_MAX_HEIGHT| while maintaining aspect-ratio.
-    if (height >= SW_RENDERING_MAX_HEIGHT) {
-      return SW_RENDERING_MAX_HEIGHT;
-    }
-    if (width >= SW_RENDERING_MAX_WIDTH) {
-      return height / width * SW_RENDERING_MAX_WIDTH;
-    }
+    return FitSwRenderSize(width, height).second;
   }
 
   return height;
